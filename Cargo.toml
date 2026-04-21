@@ -1,22 +1,23 @@
 [package]
 name = "toptl-teloxide"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
-description = "Teloxide plugin for TOP.TL — auto-post bot stats & check votes"
+rust-version = "1.70"
+authors = ["TOP.TL <hello@top.tl>"]
+description = "Teloxide plugin for TOP.TL — autopost bot stats, gate handlers behind votes, handle vote webhooks."
 license = "MIT"
 repository = "https://github.com/top-tl/teloxide"
 homepage = "https://top.tl"
-keywords = ["telegram", "teloxide", "bot", "toptl", "stats"]
-categories = ["api-bindings"]
+documentation = "https://docs.rs/toptl-teloxide"
+readme = "README.md"
+keywords = ["telegram", "teloxide", "toptl", "bot", "plugin"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
-toptl = ">=1.0.0"
-tokio = { version = "1", features = ["rt", "time", "sync"] }
+toptl = "0.1"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 log = "0.4"
-
-[dependencies.teloxide]
-version = "0.13"
-optional = true
+teloxide = { version = "0.13", optional = true }
 
 [features]
 default = ["teloxide"]

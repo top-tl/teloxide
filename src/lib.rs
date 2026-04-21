@@ -1,14 +1,23 @@
-//! Teloxide plugin for [TOP.TL](https://top.tl) — auto-post bot stats & check votes.
+//! Teloxide plugin for [TOP.TL](https://top.tl) — autopost stats, gate
+//! handlers behind votes, handle vote webhooks.
 //!
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use toptl::TopTLClient;
+//! use std::time::Duration;
+//! use toptl::TopTL;
 //! use toptl_teloxide::TopTLPlugin;
 //!
-//! let client = TopTLClient::new("your-api-token");
-//! let plugin = TopTLPlugin::new(client, "mybot");
-//! plugin.start(); // spawns background posting task
+//! #[tokio::main]
+//! async fn main() {
+//!     let client = TopTL::new("toptl_xxx");
+//!     let plugin = TopTLPlugin::new(client, "mybot");
+//!     plugin.start(Duration::from_secs(30 * 60));
+//!
+//!     // Call plugin.record(...) from your handlers, or use
+//!     // record_update(&plugin, &msg).await when the "teloxide"
+//!     // feature is enabled.
+//! }
 //! ```
 
 use std::collections::HashSet;
@@ -16,36 +25,24 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{self, Duration};
 
-/// Re-export for convenience.
-pub use toptl::TopTLClient;
+pub use toptl::{StatsPayload, TopTL};
 
-/// Tracks unique chat IDs and auto-posts stats to TOP.TL.
+/// Tracks unique users / groups / channels and autoposts counts to TOP.TL.
 #[derive(Clone)]
 pub struct TopTLPlugin {
-    client: Arc<TopTLClient>,
+    client: Arc<TopTL>,
     username: String,
     state: Arc<Mutex<PluginState>>,
 }
 
+#[derive(Default)]
 struct PluginState {
     user_ids: HashSet<i64>,
     group_ids: HashSet<i64>,
     channel_ids: HashSet<i64>,
-    post_interval_secs: u64,
 }
 
-impl Default for PluginState {
-    fn default() -> Self {
-        Self {
-            user_ids: HashSet::new(),
-            group_ids: HashSet::new(),
-            channel_ids: HashSet::new(),
-            post_interval_secs: 300,
-        }
-    }
-}
-
-/// Chat type for [`TopTLPlugin::record`].
+/// Chat kind for [`TopTLPlugin::record`].
 #[derive(Debug, Clone, Copy)]
 pub enum ChatKind {
     Private,
@@ -55,8 +52,7 @@ pub enum ChatKind {
 }
 
 impl TopTLPlugin {
-    /// Create a new plugin instance.
-    pub fn new(client: TopTLClient, username: impl Into<String>) -> Self {
+    pub fn new(client: TopTL, username: impl Into<String>) -> Self {
         Self {
             client: Arc::new(client),
             username: username.into(),
@@ -64,16 +60,9 @@ impl TopTLPlugin {
         }
     }
 
-    /// Record a user and/or chat from an incoming update.
-    ///
-    /// Call this from your handler or middleware to track unique IDs.
-    ///
-    /// ```rust,no_run
-    /// # use toptl_teloxide::{TopTLPlugin, ChatKind};
-    /// # async fn example(plugin: &TopTLPlugin) {
-    /// plugin.record(Some(12345), Some((-100123, ChatKind::Group))).await;
-    /// # }
-    /// ```
+    /// Record one update's IDs into the plugin's counters. Call from
+    /// your handler, or use [`record_update`] when the `teloxide`
+    /// feature is enabled.
     pub async fn record(&self, user_id: Option<i64>, chat: Option<(i64, ChatKind)>) {
         let mut state = self.state.lock().await;
         if let Some(uid) = user_id {
@@ -87,94 +76,92 @@ impl TopTLPlugin {
                 ChatKind::Channel => {
                     state.channel_ids.insert(cid);
                 }
-                ChatKind::Private => {
-                    // Private chats are counted as users, already tracked above.
-                }
+                ChatKind::Private => { /* private chat → already counted as user */ }
             }
         }
     }
 
-    /// Spawn a background tokio task that periodically posts stats to TOP.TL.
-    ///
-    /// The interval is initially 300 s and adapts to the server response.
-    pub fn start(&self) {
+    /// Spawn a background task that flushes stats to TOP.TL every
+    /// `interval`. Keep the plugin alive for the lifetime of your bot.
+    pub fn start(&self, interval: Duration) {
         let client = self.client.clone();
         let username = self.username.clone();
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            let mut interval_duration = {
-                let s = state.lock().await;
-                Duration::from_secs(s.post_interval_secs)
-            };
-
+            let mut ticker = time::interval(interval);
+            // Skip the immediate tick — let the bot collect at least
+            // one update before flushing.
+            ticker.tick().await;
             loop {
-                time::sleep(interval_duration).await;
-
-                let stats = {
+                ticker.tick().await;
+                let payload = {
                     let s = state.lock().await;
-                    toptl::BotStats {
-                        users: s.user_ids.len() as u64,
-                        groups: s.group_ids.len() as u64,
-                        channels: s.channel_ids.len() as u64,
+                    StatsPayload {
+                        member_count: Some(s.user_ids.len() as u64),
+                        group_count: Some(s.group_ids.len() as u64),
+                        channel_count: Some(s.channel_ids.len() as u64),
+                        bot_serves: None,
                     }
                 };
-
-                match client.post_stats(&username, &stats).await {
-                    Ok(resp) => {
-                        if let Some(new_interval) = resp.interval {
-                            let new_dur = Duration::from_secs(new_interval);
-                            if new_dur != interval_duration {
-                                interval_duration = new_dur;
-                            }
-                        }
-                        log::debug!("toptl: posted stats for {}", username);
-                    }
-                    Err(e) => {
-                        log::warn!("toptl: failed to post stats: {}", e);
-                    }
+                match client.post_stats(&username, &payload).await {
+                    Ok(_) => log::debug!("toptl: posted stats for @{username}"),
+                    Err(e) => log::warn!("toptl: post_stats for @{username} failed: {e}"),
                 }
             }
         });
     }
 
-    /// Check whether a user has voted for this bot on TOP.TL.
+    /// Has `user_id` voted for this bot on TOP.TL?
+    /// Network / auth errors fall through as `false` so vote gates
+    /// never block your bot — they're also logged at warn level.
     pub async fn has_voted(&self, user_id: i64) -> bool {
-        match self.client.has_voted(&self.username, user_id).await {
-            Ok(voted) => voted,
+        match self.client.has_voted(&self.username, user_id as u64).await {
+            Ok(check) => check.voted,
             Err(e) => {
-                log::warn!("toptl: failed to check vote for {}: {}", user_id, e);
+                log::warn!("toptl: has_voted({user_id}) failed: {e}");
                 false
             }
         }
     }
+
+    /// Flush current counts immediately. Useful from a shutdown hook.
+    pub async fn post_now(&self) -> Result<(), toptl::Error> {
+        let payload = {
+            let s = self.state.lock().await;
+            StatsPayload {
+                member_count: Some(s.user_ids.len() as u64),
+                group_count: Some(s.group_ids.len() as u64),
+                channel_count: Some(s.channel_ids.len() as u64),
+                bot_serves: None,
+            }
+        };
+        self.client.post_stats(&self.username, &payload).await?;
+        Ok(())
+    }
 }
 
-/// Convenience handler wrapper for teloxide that records every update.
+/// Helper that records every teloxide `Message` into the plugin.
 ///
 /// ```rust,no_run
 /// use teloxide::prelude::*;
-/// use toptl_teloxide::{TopTLPlugin, record_update};
+/// use toptl_teloxide::{record_update, TopTLPlugin};
 ///
 /// async fn handler(plugin: TopTLPlugin, msg: Message) {
 ///     record_update(&plugin, &msg).await;
-///     // ... your logic
+///     // your handler logic …
 /// }
 /// ```
 #[cfg(feature = "teloxide")]
 pub async fn record_update(plugin: &TopTLPlugin, msg: &teloxide::types::Message) {
     let user_id = msg.from.as_ref().map(|u| u.id.0 as i64);
-    let chat = {
-        let c = &msg.chat;
-        let kind = match c.kind {
-            teloxide::types::ChatKind::Private(_) => ChatKind::Private,
-            teloxide::types::ChatKind::Public(ref p) => match p.kind {
-                teloxide::types::PublicChatKind::Group(_) => ChatKind::Group,
-                teloxide::types::PublicChatKind::Supergroup(_) => ChatKind::Supergroup,
-                teloxide::types::PublicChatKind::Channel(_) => ChatKind::Channel,
-            },
-        };
-        Some((c.id.0, kind))
+    let kind = match msg.chat.kind {
+        teloxide::types::ChatKind::Private(_) => ChatKind::Private,
+        teloxide::types::ChatKind::Public(ref p) => match p.kind {
+            teloxide::types::PublicChatKind::Group(_) => ChatKind::Group,
+            teloxide::types::PublicChatKind::Supergroup(_) => ChatKind::Supergroup,
+            teloxide::types::PublicChatKind::Channel(_) => ChatKind::Channel,
+        },
     };
-    plugin.record(user_id, chat).await;
+    plugin.record(user_id, Some((msg.chat.id.0, kind))).await;
 }
